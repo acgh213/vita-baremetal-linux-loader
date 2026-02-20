@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <baremetal/pervasive.h>
 #include <baremetal/cdram.h>
@@ -28,6 +29,13 @@
 
 #define CPU123_WAIT_BASE 0x1F007F00
 
+/* PL310 L2 cache controller */
+#define L2X0_BASE		0x1A002000
+#define L2X0_CTRL		0x100
+#define L2X0_AUX_CTRL		0x104
+#define L2X0_CLEAN_INV_WAY	0x7FC
+#define L2X0_CACHE_SYNC		0x730
+
 extern unsigned int _bss_start;
 extern unsigned int _bss_end;
 
@@ -37,6 +45,63 @@ static const unsigned char msif_key[32] = {
 	0xE0, 0x04, 0x8D, 0x44, 0x3D, 0x63, 0xC9, 0x2C,
 	0x0B, 0x27, 0x13, 0x55, 0x41, 0xD9, 0x2E, 0xC4
 };
+
+static void flush_l1_dcache(void)
+{
+	unsigned int ccsidr, num_sets, num_ways, log2_line_len, way_shift;
+	unsigned int set, way;
+
+	/* Select L1 D-cache */
+	asm volatile("mcr p15, 2, %0, c0, c0, 0" : : "r"(0));
+	asm volatile("isb");
+	asm volatile("mrc p15, 1, %0, c0, c0, 0" : "=r"(ccsidr));
+
+	log2_line_len = (ccsidr & 7) + 4;
+	num_sets = ((ccsidr >> 13) & 0x7FFF) + 1;
+	num_ways = ((ccsidr >> 3) & 0x3FF) + 1;
+	way_shift = __builtin_clz(num_ways - 1);
+
+	for (way = 0; way < num_ways; way++)
+		for (set = 0; set < num_sets; set++)
+			asm volatile("mcr p15, 0, %0, c7, c14, 2" : :
+				"r"((way << way_shift) | (set << log2_line_len)));
+
+	asm volatile("dsb");
+	asm volatile("isb");
+}
+
+static void flush_and_disable_l2(void)
+{
+	volatile uint32_t *l2 = (volatile uint32_t *)L2X0_BASE;
+	uint32_t aux = l2[L2X0_AUX_CTRL / 4];
+	uint32_t ways = (aux & (1 << 16)) ? 16 : 8;
+	uint32_t way_mask = (1 << ways) - 1;
+
+	/* Clean and invalidate all ways */
+	l2[L2X0_CLEAN_INV_WAY / 4] = way_mask;
+	while (l2[L2X0_CLEAN_INV_WAY / 4] & way_mask)
+		;
+	/* Cache sync */
+	l2[L2X0_CACHE_SYNC / 4] = 0;
+
+	/* Do NOT disable L2 - decompressor needs it */
+	/* l2[L2X0_CTRL / 4] = 0; */
+
+	asm volatile("dsb");
+	asm volatile("isb");
+}
+
+static void flush_caches_and_disable_l2(void)
+{
+	/* Flush L1 D-cache first (writes back to L2) */
+	flush_l1_dcache();
+	/* Then flush L2 and disable it */
+	flush_and_disable_l2();
+	/* Invalidate L1 I-cache */
+	asm volatile("mcr p15, 0, %0, c7, c5, 0" : : "r"(0));
+	asm volatile("dsb");
+	asm volatile("isb");
+}
 
 static void LOG(const char *str, ...)
 {
@@ -183,6 +248,9 @@ int main(struct sysroot_buffer *sysroot)
 	}
 
 	LOG("Jumping to Linux!\n");
+
+	/* Flush all caches and disable L2 to prevent stale data issues */
+	flush_caches_and_disable_l2();
 
 	((void (*)(int, int, uintptr_t))LINUX_LOAD_ADDR)(0, 0, DTB_LOAD_ADDR);
 

@@ -15,8 +15,10 @@ _start:
 	mrc p15, 0, r1, c0, c0, 5
 	ands r1, r1, #0xF
 
-	# Setup the SP at the end of the scratchpad
+	# Keep 0x7F00-0x7FFF free for Linux secondary mailboxes, then
+	# partition the remaining scratchpad stacks by CPU ID.
 	mov sp, #0x00008000
+	sub sp, sp, #0x100
 	sub sp, r1, lsl #13
 
 	# Jump to the C code

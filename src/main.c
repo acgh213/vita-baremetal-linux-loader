@@ -55,11 +55,19 @@ static void LOG(const char *str, ...)
 static void cpu123_wait(unsigned int cpu_id)
 {
 	volatile unsigned int val, *base = (unsigned int *)CPU123_WAIT_BASE;
+
+	base[cpu_id] = 0;
+	dsb();
+
 	while (1) {
-		wfe();
 		val = base[cpu_id];
-		if (val)
+		if (val) {
 			((void (*)())val)();
+			base[cpu_id] = 0;
+			dsb();
+			continue;
+		}
+		wfe();
 	}
 }
 
@@ -82,6 +90,21 @@ static FRESULT file_load(const char *path, uintptr_t addr, UINT *nread)
 	f_close(&file);
 
 	return FR_OK;
+}
+
+/* Clean and invalidate the PL310 L2 cache before entering Linux.  CP15 cache
+ * operations do not propagate to this MMIO-controlled outer cache. */
+static void pl310_clean_inv_all(void)
+{
+	volatile uint32_t *l2 = (volatile uint32_t *)0x1A002000;
+	uint32_t aux = l2[0x104 / 4];		/* L2X0_AUX_CTRL */
+	uint32_t mask = (aux & (1 << 16)) ? 0xFFFF : 0xFF;
+
+	l2[0x7FC / 4] = mask;			/* L2X0_CLEAN_INV_WAY */
+	while (l2[0x7FC / 4] != 0)
+		;
+	l2[0x730 / 4] = 0;			/* L2X0_CACHE_SYNC */
+	__asm__ __volatile__("dsb" ::: "memory");
 }
 
 static FRESULT file_load_log(const char *path, uintptr_t addr)
@@ -183,6 +206,7 @@ int main(struct sysroot_buffer *sysroot)
 	}
 
 	LOG("Jumping to Linux!\n");
+	pl310_clean_inv_all();
 
 	((void (*)(int, int, uintptr_t))LINUX_LOAD_ADDR)(0, 0, DTB_LOAD_ADDR);
 

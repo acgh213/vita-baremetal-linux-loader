@@ -31,6 +31,7 @@
 extern unsigned int _bss_start;
 extern unsigned int _bss_end;
 extern void l1_cache_clean_invalidate(void);
+extern void smp_diag_install_vectors(void);
 
 static const unsigned char msif_key[32] = {
 	0xD4, 0x19, 0xA2, 0xEB, 0x9D, 0x61, 0xA5, 0x2F,
@@ -56,8 +57,8 @@ static void LOG(const char *str, ...)
 static void cpu123_wait(unsigned int cpu_id)
 {
 	volatile unsigned int val, *base = (unsigned int *)CPU123_WAIT_BASE;
-	/* Per-core breadcrumbs at 0x1F007F40 + cpu_id*16 (read via devmem
-	 * after boot; 4 words per core, 3 cores -> 0x40..0x6F):
+	/* Per-core breadcrumbs at 0x1F007F40 + cpu_id*16 (actual blocks:
+	 * CPU1 0x1F007F50, CPU2 0x1F007F60, CPU3 0x1F007F70):
 	 *   +0  0xC0DE000n  reached the park loop
 	 *   +1  raw MPIDR   affinity of this core
 	 *   +2  0xC0DE000n  consumed mailbox, jumped to secondary_startup
@@ -67,6 +68,10 @@ static void cpu123_wait(unsigned int cpu_id)
 	unsigned int mpidr;
 
 	__asm__ __volatile__("mrc p15, 0, %0, c0, c0, 5" : "=r"(mpidr));
+
+	/* SMP DIAGNOSTIC: catch exceptions between the mailbox jump and
+	 * Linux replacing VBAR. Records live at 0x1F007FB0 + cpu*16. */
+	smp_diag_install_vectors();
 
 	bc[0] = 0xC0DE0000 | cpu_id;
 	bc[1] = mpidr;

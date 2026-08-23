@@ -15,8 +15,12 @@ _start:
 	mrc p15, 0, r1, c0, c0, 5
 	ands r1, r1, #0xF
 
-	# Setup the SP at the end of the scratchpad
+	# Reserve the top 0x100 bytes of the scratchpad alias for the
+	# secondary mailbox and diagnostics at 0x1F007F00..0x1F007FFF.
+	# The low 0x00007Fxx window aliases that physical range, so letting
+	# CPU0 grow down directly from 0x8000 corrupts live mailbox slots.
 	mov sp, #0x00008000
+	sub sp, sp, #0x100
 	sub sp, r1, lsl #13
 
 	# Jump to the C code

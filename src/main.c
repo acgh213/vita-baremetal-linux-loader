@@ -145,11 +145,16 @@ static void gpu_pervasive_on_logged(void)
 }
 
 /*
- * Full read-only sweep of the Pervasive VID block plus the key single slots
- * that matter for the GPU power differential.  Compact two-line-per-block
- * format to fit the framebuffer log.  Reads only, no writes.
+ * Read-only sweep, v2: short 4-word lines that fit the 1280px framebuffer
+ * (glyphs are ~16px wide, so ~78 chars max per line) and multiple read
+ * contexts for the +0x10 slot to detect any read-order latching:
+ *   v0: reads +0x10 FIRST, then +0x00/+0x04/+0x08
+ *   v1: reads +0x0C/+0x14/+0x18/+0x1C (no +0x10)
+ *   k:  reads reset/gate/clk +0x10, then +0x10 again as the 4th
+ *   m:  reads misc+0xB0, gate+0x24, reset+0x24, then +0x10 again
+ *   v2/v3: the rest of the VID block
  */
-static void gpu_vid_sweep(const char *tag)
+static void gpu_vid_sweep2(const char *tag)
 {
 	volatile uint32_t *vid  = (volatile uint32_t *)PERVASIVE_VID;
 	volatile uint32_t *gate = (volatile uint32_t *)PERVASIVE_GATE;
@@ -157,18 +162,37 @@ static void gpu_vid_sweep(const char *tag)
 	volatile uint32_t *clk  = (volatile uint32_t *)PERVASIVE_CLK;
 	volatile uint32_t *misc = (volatile uint32_t *)0xE3100000;
 
-	LOG("GPU sweep %s: vid0 =%08X %08X %08X %08X %08X %08X %08X %08X\n",
-	    tag,
-	    vid[0x00/4], vid[0x04/4], vid[0x08/4], vid[0x0C/4],
-	    vid[0x10/4], vid[0x14/4], vid[0x18/4], vid[0x1C/4]);
-	LOG("GPU sweep %s: vid1 =%08X %08X %08X %08X %08X %08X %08X %08X\n",
-	    tag,
-	    vid[0x20/4], vid[0x24/4], vid[0x28/4], vid[0x2C/4],
+	LOG("%s v0: %08X %08X %08X %08X\n", tag,
+	    vid[0x10/4], vid[0x00/4], vid[0x04/4], vid[0x08/4]);
+	LOG("%s v1: %08X %08X %08X %08X\n", tag,
+	    vid[0x0C/4], vid[0x14/4], vid[0x18/4], vid[0x1C/4]);
+	LOG("%s k: %08X %08X %08X %08X\n", tag,
+	    reset[0x10/4], gate[0x10/4], clk[0x10/4], vid[0x10/4]);
+	LOG("%s m: %08X %08X %08X %08X\n", tag,
+	    misc[0xB0/4], gate[0x24/4], reset[0x24/4], vid[0x10/4]);
+	LOG("%s v2: %08X %08X %08X %08X\n", tag,
+	    vid[0x20/4], vid[0x24/4], vid[0x28/4], vid[0x2C/4]);
+	LOG("%s v3: %08X %08X %08X %08X\n", tag,
 	    vid[0x30/4], vid[0x34/4], vid[0x38/4], vid[0x3C/4]);
-	LOG("GPU sweep %s: g10=%08X r10=%08X c10=%08X miscB0=%08X g24=%08X r24=%08X\n",
-	    tag,
-	    gate[0x10/4], reset[0x10/4], clk[0x10/4], misc[0xB0/4],
-	    gate[0x24/4], reset[0x24/4]);
+}
+
+/*
+ * Zero the HDMI framebuffer (CDRAM 0x20000000) before the log starts so
+ * stale pixels from the previous boot/VitaOS cannot blend into the glyphs.
+ * The loader draws white-on-black without clearing otherwise.
+ */
+static void clear_framebuffer(void)
+{
+	volatile uint32_t *fb = (volatile uint32_t *)0x20000000;
+	unsigned int i;
+
+	for (i = 0; i < (1280u * 720u * 4u) / 4u; i += 4)
+	{
+		fb[i] = 0;
+		fb[i+1] = 0;
+		fb[i+2] = 0;
+		fb[i+3] = 0;
+	}
 }
 
 static void cpu123_wait(unsigned int cpu_id)
@@ -324,10 +348,10 @@ int main(struct sysroot_buffer *sysroot)
 			goto fatal_error;
 	}
 
-	LOG("GPU gate: pervasive enable sequence\n");
-	gpu_vid_sweep("BEF");
+	LOG("SWEEPv2 %s\n", "BEF");
+	gpu_vid_sweep2("B");
 	gpu_pervasive_on_logged();
-	gpu_vid_sweep("AFT");
+	gpu_vid_sweep2("A");
 	LOG("Jumping to Linux!\n");
 	pl310_clean_inv_all();
 

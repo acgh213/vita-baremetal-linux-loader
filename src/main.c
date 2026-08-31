@@ -118,6 +118,36 @@ static uint32_t gpu_xbar_freq_set(uint32_t freq)
 	return r0;
 }
 
+/*
+ * Retail 3.60 secure-world evidence:
+ *   SceKernelIntrMgr registers sub_81000FC0 as SMC 0x107.
+ *   The handler treats r0 bits 0..4 as selectors for the five ACL words at
+ *   SceSonyRegbus 0xE8000000 + 4*i.  For each selected word it replaces the
+ *   low nibble with r1 | (r1 << 2), accepting r1 values 0, 1, or 2.
+ *   SceSonyRegbus +0x10 controls the SGX-facing slot; its reset value is 0x4
+ *   and SKBL's observed configured value is 0xA.  Therefore the exact
+ *   reassertion is mode bit 4 (0x10), command 2 (0xA).
+ *
+ * This changes only the secure Regbus ACL.  It does not touch an SGX register.
+ */
+static uint32_t gpu_regbus_access_mode_sgx(void)
+{
+	register uint32_t r0 asm("r0") = 0x10;
+	register uint32_t r1 asm("r1") = 2;
+	register uint32_t r2 asm("r2") = 0;
+	register uint32_t r3 asm("r3") = 0;
+	register uint32_t r12 asm("r12") = 0x107;
+
+	asm volatile(
+		"smc #0\n	"
+		: "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3)
+		: "r"(r12)
+		: "memory", "cc"
+	);
+
+	return r0;
+}
+
 static void gpu_pervasive_on_logged(void)
 {
 	volatile uint32_t *reset = (volatile uint32_t *)PERVASIVE_RESET;
@@ -297,6 +327,8 @@ int main(struct sysroot_buffer *sysroot)
 			goto fatal_error;
 	}
 
+	LOG("GPU route: SMC 0x107 mode=0x10 cmd=2\n");
+	LOG("GPU route: SMC return=0x%08X\n", gpu_regbus_access_mode_sgx());
 	LOG("GPU gate: SMC 0x110 domain=0 state=1\n");
 	LOG("GPU gate: return=0x%08X\n", gpu_power_domain_on());
 	LOG("GPU gate: pervasive enable sequence\n");

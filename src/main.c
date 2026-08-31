@@ -327,12 +327,12 @@ int main(struct sysroot_buffer *sysroot)
 			goto fatal_error;
 	}
 
-	LOG("GPU route: SMC 0x107 mode=0x10 cmd=2\n");
-	LOG("GPU route: SMC return=0x%08X\n", gpu_regbus_access_mode_sgx());
 	LOG("GPU gate: SMC 0x110 domain=0 state=1\n");
 	LOG("GPU gate: return=0x%08X\n", gpu_power_domain_on());
 	LOG("GPU gate: pervasive enable sequence\n");
 	gpu_pervasive_on_logged();
+	LOG("GPU route: SMC 0x107 mode=0x10 cmd=2 (after enable)\n");
+	LOG("GPU route: SMC return=0x%08X\n", gpu_regbus_access_mode_sgx());
 	LOG("Jumping to Linux!\n");
 	pl310_clean_inv_all();
 

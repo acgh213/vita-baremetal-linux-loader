@@ -52,6 +52,98 @@ static void LOG(const char *str, ...)
 	font_draw_string(10, console_y+=20, WHITE, buf);
 }
 
+/*
+ * VitaOS lowio.skprx implements its GPU-domain-on export as SMC 0x110 with
+ * r0=0 (GPU domain) and r1=1 (on).  Keep this wrapper explicit: the current
+ * vita-libbaremetal smc() helper incorrectly loads r1-r3 from arg1, which
+ * would turn this request into r0=0, r1=0 (off).
+ */
+static uint32_t gpu_power_domain_on(void)
+{
+	register uint32_t r0 asm("r0") = 0;
+	register uint32_t r1 asm("r1") = 1;
+	register uint32_t r2 asm("r2") = 0;
+	register uint32_t r3 asm("r3") = 0;
+	register uint32_t r12 asm("r12") = 0x110;
+
+	asm volatile(
+		"smc #0\n	"
+		: "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3)
+		: "r"(r12)
+		: "memory", "cc"
+	);
+
+	return r0;
+}
+
+/*
+ * VitaOS SceLowio gpu_on evidence (lowio.skprx.elf, local decompilation):
+ *   ScePervasiveForDriver_84EAB5BC -> SMC 0x110, r0=0, r1=1 (power domain on)
+ *   ScePervasiveForDriver_39E51AE2 -> gate[0x10] |= (gate & 0xF000F)
+ *   ScePervasiveForDriver_8A85E36B -> reset[0x10] &= ~1
+ * Physical bases resolved from the lowio init table:
+ *   reset  0xE3101000   (s_data_8100B094)
+ *   gate   0xE3102000   (s_data_8100B09C)
+ *   clocks 0xE3103000   (s_data_8100B0A0)
+ *   vid    0xE3104000   (s_data_8100B08C)
+ * This is the platform enable only. No SGX register is written.
+ */
+#define PERVASIVE_RESET 0xE3101000u
+#define PERVASIVE_GATE  0xE3102000u
+#define PERVASIVE_CLK   0xE3103000u
+#define PERVASIVE_VID   0xE3104000u
+
+/*
+ * VitaOS SceLowio/ScePower GPU Xbar evidence (SMC table + power.elf disasm):
+ *   SMC 0x114 op 2 = smc_bus_freq_op(2, freq) = Set GPU Xbar frequency
+ *   lowio export ScePervasiveForDriver_7D02215D = sub_8100001E(2, a1)
+ *   ScePower stub 0x810046C0; passes freq index 0 (166 MHz) when GPU clk <= 166.
+ * The GPU Xbar is the crossbar between the ARM and the SGX543 register file.
+ */
+static uint32_t gpu_xbar_freq_set(uint32_t freq)
+{
+	register uint32_t r0 asm("r0") = 2; /* op 2 = Set GPU Xbar frequency */
+	register uint32_t r1 asm("r1") = freq;
+	register uint32_t r2 asm("r2") = 0;
+	register uint32_t r3 asm("r3") = 0;
+	register uint32_t r12 asm("r12") = 0x114;
+
+	asm volatile(
+		"smc #0\n\t"
+		: "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3)
+		: "r"(r12)
+		: "memory", "cc"
+	);
+
+	return r0;
+}
+
+static void gpu_pervasive_on_logged(void)
+{
+	volatile uint32_t *reset = (volatile uint32_t *)PERVASIVE_RESET;
+	volatile uint32_t *gate  = (volatile uint32_t *)PERVASIVE_GATE;
+	volatile uint32_t *clk   = (volatile uint32_t *)PERVASIVE_CLK;
+	volatile uint32_t *vid   = (volatile uint32_t *)PERVASIVE_VID;
+
+	LOG("GPU gate: pervasive before reset=%08X gate=%08X clk=%08X vid=%08X\n",
+	    reset[0x10/4], gate[0x10/4], clk[0x10/4], vid[0x10/4]);
+
+	LOG("GPU gate: SMC 0x110 domain=0 state=1\n");
+	LOG("GPU gate: SMC return=0x%08X\n", gpu_power_domain_on());
+
+	LOG("GPU gate: SMC 0x114 op=2 xbar_freq=0\n");
+	LOG("GPU gate: SMC 0x114 return=0x%08X\n", gpu_xbar_freq_set(0));
+
+	gate[0x10/4] |= 0xF000F;
+	LOG("GPU gate: gate[0x10] set -> %08X\n", gate[0x10/4]);
+
+	reset[0x10/4] &= ~1u;
+	LOG("GPU gate: reset[0x10] clear -> %08X\n", reset[0x10/4]);
+
+	LOG("GPU gate: pervasive after reset=%08X gate=%08X clk=%08X vid=%08X\n",
+	    reset[0x10/4], gate[0x10/4], clk[0x10/4], vid[0x10/4]);
+}
+
 static void cpu123_wait(unsigned int cpu_id)
 {
 	volatile unsigned int val, *base = (unsigned int *)CPU123_WAIT_BASE;
@@ -205,6 +297,10 @@ int main(struct sysroot_buffer *sysroot)
 			goto fatal_error;
 	}
 
+	LOG("GPU gate: SMC 0x110 domain=0 state=1\n");
+	LOG("GPU gate: return=0x%08X\n", gpu_power_domain_on());
+	LOG("GPU gate: pervasive enable sequence\n");
+	gpu_pervasive_on_logged();
 	LOG("Jumping to Linux!\n");
 	pl310_clean_inv_all();
 

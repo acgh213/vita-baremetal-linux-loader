@@ -118,36 +118,6 @@ static uint32_t gpu_xbar_freq_set(uint32_t freq)
 	return r0;
 }
 
-/*
- * Retail 3.60 secure-world evidence:
- *   SceKernelIntrMgr registers sub_81000FC0 as SMC 0x107.
- *   The handler treats r0 bits 0..4 as selectors for the five ACL words at
- *   SceSonyRegbus 0xE8000000 + 4*i.  For each selected word it replaces the
- *   low nibble with r1 | (r1 << 2), accepting r1 values 0, 1, or 2.
- *   SceSonyRegbus +0x10 controls the SGX-facing slot; its reset value is 0x4
- *   and SKBL's observed configured value is 0xA.  Therefore the exact
- *   reassertion is mode bit 4 (0x10), command 2 (0xA).
- *
- * This changes only the secure Regbus ACL.  It does not touch an SGX register.
- */
-static uint32_t gpu_regbus_access_mode_sgx(void)
-{
-	register uint32_t r0 asm("r0") = 0x10;
-	register uint32_t r1 asm("r1") = 2;
-	register uint32_t r2 asm("r2") = 0;
-	register uint32_t r3 asm("r3") = 0;
-	register uint32_t r12 asm("r12") = 0x107;
-
-	asm volatile(
-		"smc #0\n	"
-		: "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3)
-		: "r"(r12)
-		: "memory", "cc"
-	);
-
-	return r0;
-}
-
 static void gpu_pervasive_on_logged(void)
 {
 	volatile uint32_t *reset = (volatile uint32_t *)PERVASIVE_RESET;
@@ -172,6 +142,33 @@ static void gpu_pervasive_on_logged(void)
 
 	LOG("GPU gate: pervasive after reset=%08X gate=%08X clk=%08X vid=%08X\n",
 	    reset[0x10/4], gate[0x10/4], clk[0x10/4], vid[0x10/4]);
+}
+
+/*
+ * Full read-only sweep of the Pervasive VID block plus the key single slots
+ * that matter for the GPU power differential.  Compact two-line-per-block
+ * format to fit the framebuffer log.  Reads only, no writes.
+ */
+static void gpu_vid_sweep(const char *tag)
+{
+	volatile uint32_t *vid  = (volatile uint32_t *)PERVASIVE_VID;
+	volatile uint32_t *gate = (volatile uint32_t *)PERVASIVE_GATE;
+	volatile uint32_t *reset = (volatile uint32_t *)PERVASIVE_RESET;
+	volatile uint32_t *clk  = (volatile uint32_t *)PERVASIVE_CLK;
+	volatile uint32_t *misc = (volatile uint32_t *)0xE3100000;
+
+	LOG("GPU sweep %s: vid0 =%08X %08X %08X %08X %08X %08X %08X %08X\n",
+	    tag,
+	    vid[0x00/4], vid[0x04/4], vid[0x08/4], vid[0x0C/4],
+	    vid[0x10/4], vid[0x14/4], vid[0x18/4], vid[0x1C/4]);
+	LOG("GPU sweep %s: vid1 =%08X %08X %08X %08X %08X %08X %08X %08X\n",
+	    tag,
+	    vid[0x20/4], vid[0x24/4], vid[0x28/4], vid[0x2C/4],
+	    vid[0x30/4], vid[0x34/4], vid[0x38/4], vid[0x3C/4]);
+	LOG("GPU sweep %s: g10=%08X r10=%08X c10=%08X miscB0=%08X g24=%08X r24=%08X\n",
+	    tag,
+	    gate[0x10/4], reset[0x10/4], clk[0x10/4], misc[0xB0/4],
+	    gate[0x24/4], reset[0x24/4]);
 }
 
 static void cpu123_wait(unsigned int cpu_id)
@@ -327,12 +324,10 @@ int main(struct sysroot_buffer *sysroot)
 			goto fatal_error;
 	}
 
-	LOG("GPU gate: SMC 0x110 domain=0 state=1\n");
-	LOG("GPU gate: return=0x%08X\n", gpu_power_domain_on());
 	LOG("GPU gate: pervasive enable sequence\n");
+	gpu_vid_sweep("BEF");
 	gpu_pervasive_on_logged();
-	LOG("GPU route: SMC 0x107 mode=0x10 cmd=2 (after enable)\n");
-	LOG("GPU route: SMC return=0x%08X\n", gpu_regbus_access_mode_sgx());
+	gpu_vid_sweep("AFT");
 	LOG("Jumping to Linux!\n");
 	pl310_clean_inv_all();
 

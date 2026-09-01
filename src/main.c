@@ -154,7 +154,7 @@ static void gpu_pervasive_on_logged(void)
  *   m:  reads misc+0xB0, gate+0x24, reset+0x24, then +0x10 again
  *   v2/v3: the rest of the VID block
  */
-static void gpu_vid_sweep2(const char *tag)
+static void __attribute__((unused)) gpu_vid_sweep2(const char *tag)
 {
 	volatile uint32_t *vid  = (volatile uint32_t *)PERVASIVE_VID;
 	volatile uint32_t *gate = (volatile uint32_t *)PERVASIVE_GATE;
@@ -174,6 +174,217 @@ static void gpu_vid_sweep2(const char *tag)
 	    vid[0x20/4], vid[0x24/4], vid[0x28/4], vid[0x2C/4]);
 	LOG("%s v3: %08X %08X %08X %08X\n", tag,
 	    vid[0x30/4], vid[0x34/4], vid[0x38/4], vid[0x3C/4]);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * VDDG gate (2026-08-31).  Static prerequisites recovered in
+ * lab/gpu-re/PHASE1-VDDG-STATIC-RESULT-2026-08-31.md:
+ *
+ *   sceSysconCtrlVoltageForDriver = SceSysconForDriver NID 0x7F198FA2,
+ *   syscon.skprx 0x81005AAC -> syscon command 0x88E, wire length 3,
+ *   data bytes [rail, code].  rail 4 = VDDG.
+ *
+ *   ScePower computes code = 0x8A - vid, with two cached VIDs copied from
+ *   the ScePervasiveVid block (0xE3104000):
+ *       +0x44 = 0x23  high-clock VID -> code 0x67
+ *       +0x48 = 0x2E  low-clock  VID -> code 0x5C
+ *
+ * Sony's handler is NOT a straight pass-through.  Decision tree at
+ * 0x81005AAC (hw = hardware-info word, masked 0x00FF0000):
+ *
+ *   if (code <= 0x3F):
+ *        if (hw >= 0x600000) -> extra checks; else send raw
+ *   else:                                  <-- BOTH our codes land here
+ *        if (hw >= 0x600000):
+ *              if (hw != 0x700000) -> REJECT (0x80250001)
+ *              else -> fall into the remap path below
+ *        remap path: require (code - 0x4D) <= 0x3F, then code = 0x8C - code
+ *
+ * So for code 0x67 the byte that actually reaches syscon is either 0x67
+ * (raw) or 0x8C-0x67 = 0x25 (remapped), depending on the SoC revision.
+ * We do NOT know PSTV's hardware-info word, so we reproduce the tree
+ * exactly rather than guessing, and we log the inputs and the resolved
+ * byte so the run is interpretable even if the write has no visible
+ * effect.
+ *
+ * libbaremetal note: syscon_short_command_write(cmd, data, length) writes
+ * (length + 1) to the wire length field.  Sony's ksceSysconCtrlDeviceReset
+ * uses wire length 3 and libbaremetal expresses the same call as
+ * syscon_short_command_write(0x88F, ..., 2) -- so its `length` argument is
+ * the DATA BYTE COUNT.  Our packet has 2 data bytes [rail, code] and wire
+ * length 3, therefore length = 2.
+ */
+#define SYSCON_CMD_CTRL_VOLTAGE  0x88E
+#define VDDG_RAIL                4
+
+/* Returns the byte Sony would actually put on the wire, or 0xFFFFFFFF if
+ * the request would be rejected. */
+static uint32_t vddg_resolve_code(uint32_t code, uint32_t hw_masked)
+{
+	if (code <= 0x3F) {
+		/* Low-code path.  Not used by our VIDs, kept for completeness. */
+		if (hw_masked >= 0x600000) {
+			if (hw_masked == 0x700000)
+				return code;
+			if (hw_masked >= 0x800000 || hw_masked == 0x720000)
+				return (code > 0x3B) ? code : 0xFFFFFFFFu;
+			return 0xFFFFFFFFu;
+		}
+		return code;
+	}
+
+	/* High-code path -- this is where 0x67 / 0x5C land. */
+	if (hw_masked >= 0x600000) {
+		if (hw_masked != 0x700000)
+			return 0xFFFFFFFFu;   /* would return 0x80250001 */
+	}
+	if ((code - 0x4D) > 0x3F)
+		return 0xFFFFFFFFu;
+	return 0x8C - code;
+}
+
+/*
+ * Probe the SGX aperture read-only.  This is the effect check: if the VDDG
+ * write is what the window was waiting on, 0xE8400000 should stop reading
+ * back as the uniform dark pattern.
+ *
+ * SAFETY: this payload runs with NO exception vectors installed (start.s
+ * sets a stack and branches to main; VBAR still points at whatever VitaOS
+ * left).  Under Linux these addresses SIGBUS -- here an imprecise data
+ * abort would be unrecoverable and would hang the box, needing a physical
+ * power cycle.  So we install a minimal vector table with a data-abort
+ * handler that skips the faulting instruction and flags the fault, giving
+ * us a survivable read.
+ *
+ * Note the aborts on this bus are asynchronous/imprecise, so we bracket
+ * each read with a dsb to force the fault to land inside our window.
+ */
+static volatile uint32_t abort_flag;
+static uint32_t saved_vbar;
+
+/* Data-abort handler: mark the fault and resume after the faulting insn.
+ * lr_abt points to faulting_pc + 8 for data aborts. */
+static void __attribute__((naked)) abort_handler(void)
+{
+	asm volatile(
+		"ldr r0, =abort_flag\n	"
+		"mov r1, #1\n	"
+		"str r1, [r0]\n	"
+		"subs pc, lr, #4\n	"
+	);
+}
+
+static void install_abort_vectors(void)
+{
+	/*
+	 * Build a tiny vector table at 0x1F000000 (scratch, well clear of the
+	 * Linux mailboxes at 0x7F00 and the payload itself) and point VBAR at
+	 * it.  Every entry is 'ldr pc, [pc, #24]' -> address slot, so the
+	 * table is 8 branch words + 8 address words.
+	 */
+	volatile uint32_t *vt = (volatile uint32_t *)0x1F000000;
+	unsigned int i;
+
+	asm volatile("mrc p15, 0, %0, c12, c0, 0" : "=r"(saved_vbar));
+
+	for (i = 0; i < 8; i++) {
+		vt[i] = 0xE59FF018;              /* ldr pc, [pc, #24] */
+		vt[8 + i] = (uint32_t)abort_handler;
+	}
+
+	asm volatile("dsb\n	"
+		     "isb\n	"
+		     "mcr p15, 0, %0, c12, c0, 0\n	"   /* VBAR = vt */
+		     "isb\n	"
+		     : : "r"(vt) : "memory");
+}
+
+/* Put VBAR back exactly as VitaOS left it, before handing off to Linux. */
+static void restore_vectors(void)
+{
+	asm volatile("dsb\n	"
+		     "isb\n	"
+		     "mcr p15, 0, %0, c12, c0, 0\n	"
+		     "isb\n	"
+		     : : "r"(saved_vbar) : "memory");
+}
+
+/* Read one word with abort protection.  Returns 1 on success. */
+static int safe_read32(uint32_t addr, uint32_t *out)
+{
+	uint32_t v;
+
+	abort_flag = 0;
+	asm volatile("dsb" ::: "memory");
+	v = *(volatile uint32_t *)addr;
+	asm volatile("dsb" ::: "memory");
+
+	if (abort_flag) {
+		*out = 0;
+		return 0;
+	}
+	*out = v;
+	return 1;
+}
+
+static void sgx_probe(const char *tag)
+{
+	uint32_t sgx = 0, rb = 0, gb = 0;
+	int s, r, g;
+
+	s = safe_read32(0xE8400000, &sgx);   /* the SGX itself */
+	r = safe_read32(0xE8000000, &rb);    /* secure SonyRegbus */
+	g = safe_read32(0xED800000, &gb);    /* GPU reg bus - positive control */
+
+	LOG("%s sgx=%s%08X rb=%s%08X gb=%s%08X\n", tag,
+	    s ? "" : "AB:", sgx,
+	    r ? "" : "AB:", rb,
+	    g ? "" : "AB:", gb);
+}
+
+static void vddg_gate(void)
+{
+	volatile uint32_t *vid = (volatile uint32_t *)PERVASIVE_VID;
+	uint32_t vid_hi, vid_lo, code_hi, wire_hi;
+	uint32_t hw, hw_masked;
+
+	/* 1. Read the VIDs from the block ScePower actually sources them from. */
+	vid_hi = vid[0x44 / 4];
+	vid_lo = vid[0x48 / 4];
+	LOG("VDDG vid hi=%08X lo=%08X\n", vid_hi, vid_lo);
+
+	/* 2. Sony's revision gate input. */
+	hw = (uint32_t)syscon_get_hardware_info();
+	hw_masked = hw & 0x00FF0000u;
+	LOG("VDDG hw=%08X mask=%08X\n", hw, hw_masked);
+
+	/* 3. Resolve the wire byte the way Sony would. */
+	code_hi = 0x8A - vid_hi;
+	wire_hi = vddg_resolve_code(code_hi, hw_masked);
+	LOG("VDDG code=%02X wire=%08X\n", code_hi, wire_hi);
+
+	sgx_probe("VDDG pre");
+
+	if (wire_hi == 0xFFFFFFFFu) {
+		/* Sony's own handler would refuse this request.  Do not send it. */
+		LOG("VDDG REJECTED by revision gate - no write\n");
+		return;
+	}
+
+	/*
+	 * 4. The write.  data = [rail, code] little-endian in the u32:
+	 *    byte0 = rail (4), byte1 = resolved code.
+	 *    length = 2 data bytes (libbaremetal adds 1 -> wire length 3).
+	 */
+	LOG("VDDG WRITE cmd=88E rail=4 code=%02X\n", wire_hi);
+	syscon_short_command_write(SYSCON_CMD_CTRL_VOLTAGE,
+				   VDDG_RAIL | (wire_hi << 8), 2);
+	LOG("VDDG write issued\n");
+
+	/* 5. Let the rail settle, then re-probe. */
+	delay(200);
+	sgx_probe("VDDG post");
 }
 
 /*
@@ -348,10 +559,30 @@ int main(struct sysroot_buffer *sysroot)
 			goto fatal_error;
 	}
 
-	LOG("SWEEPv2 %s\n", "BEF");
-	gpu_vid_sweep2("B");
+	/*
+	 * VDDG gate, 2026-08-31.
+	 *
+	 * Sony's ScePower raises the GPU core rail BEFORE clocking the GPU up
+	 * (VDDG write at 0x81003576, then the Xbar SMC).  Every previous
+	 * loader experiment skipped the voltage step, so this run reproduces
+	 * the real order: clear the screen, install abort vectors so the SGX
+	 * probe cannot hang the box, write VDDG, THEN run the platform enable,
+	 * then re-probe the aperture.
+	 *
+	 * NOTE: sweep v2 defined clear_framebuffer() but never called it --
+	 * fixed here.
+	 */
+	clear_framebuffer();
+	install_abort_vectors();
+
+	LOG("VDDG GATE %s\n", "2026-08-31");
+	vddg_gate();
 	gpu_pervasive_on_logged();
-	gpu_vid_sweep2("A");
+	sgx_probe("VDDG final");
+
+	/* Hand VBAR back the way we found it before entering Linux. */
+	restore_vectors();
+
 	LOG("Jumping to Linux!\n");
 	pl310_clean_inv_all();
 

@@ -218,6 +218,23 @@ static void __attribute__((unused)) gpu_vid_sweep2(const char *tag)
 #define SYSCON_CMD_CTRL_VOLTAGE  0x88E
 #define VDDG_RAIL                4
 
+/*
+ * RESOLVE-ONLY MODE.
+ *
+ * The 2026-10-20 run of the corrected gate hung the device: it was the first
+ * build in which syscon_short_command_write(0x88E, ...) ever executed, and the
+ * box went off the network instead of reaching Linux. Sony's gate logic is
+ * therefore still unverified, and sending the write again would just re-hang.
+ *
+ * This build computes and logs the gate decision and returns BEFORE any write,
+ * so the polarity fix can be checked with no syscon traffic at all. The rest of
+ * main() (platform enable, probes, Linux handoff) is untouched: the box should
+ * still boot Linux, which is what lets the CDRAM framebuffer log be read back.
+ *
+ * Set to 0 to restore write behaviour (and re-read the bounded-wait note first).
+ */
+#define VDDG_RESOLVE_ONLY 1
+
 /* Returns the byte Sony would actually put on the wire, or 0xFFFFFFFF if
  * the request would be rejected.  `arm` receives a short label naming the
  * path taken so a hardware run can be interpreted without re-deriving it.
@@ -409,8 +426,25 @@ static void vddg_gate(void)
 	arm = "?";
 	wire_hi = vddg_resolve_code(code_hi, hw_masked, &arm);
 	LOG("VDDG code=%02X arm=%s wire=%08X\n", code_hi, arm, wire_hi);
+	{
+		/* Second cached VID, resolved only for gate evidence. */
+		const char *arm_lo = "?";
+		uint32_t code_lo = 0x8A - vid_lo;
+		uint32_t wire_lo = vddg_resolve_code(code_lo, hw_masked, &arm_lo);
+		LOG("VDDG lo=%08X code=%02X arm=%s wire=%08X\n",
+		    vid_lo, code_lo, arm_lo, wire_lo);
+	}
 
 	sgx_probe("VDDG pre");
+
+#if VDDG_RESOLVE_ONLY
+	/*
+	 * No write. Log the decision and return; main() continues into the
+	 * platform enable and the Linux handoff exactly as before.
+	 */
+	LOG("VDDG RESOLVE-ONLY: no write issued\n");
+	return;
+#endif
 
 	if (wire_hi == 0xFFFFFFFFu) {
 		/* Sony's own handler would refuse this request.  Do not send it. */

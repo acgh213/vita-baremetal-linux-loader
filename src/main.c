@@ -66,28 +66,95 @@ DWORD get_fattime(void)
 	return ((DWORD)(2026 - 1980) << 25) | ((DWORD)1 << 21) | ((DWORD)1 << 16);
 }
 
+/*
+ * Log mailbox.
+ *
+ * The display is not a usable log channel here and FatFs has no write path
+ * (diskio.c:disk_write is a stub), so loader output goes into RAM that Linux
+ * cannot allocate: the top 64 KiB of DRAM, carved out by shrinking the memory
+ * node in pstv.dtb to 0x1FD00000.  Linux reads it back with /dev/mem mmap over
+ * SSH, which is the one channel proven to work on this device.
+ *
+ * Layout at LOG_MAILBOX:
+ *   [0] magic 0x47444456 ("VDDG")
+ *   [1] text length in bytes
+ *   [2] 0x4C4F4700 ("LOG.") - written last, so the magic only appears once the
+ *       text below it is already visible
+ *   [3] reserved
+ *   [16...] NUL-terminated log text
+ *
+ * The data is dirty in L1 when written, so clean it to the point of coherency
+ * before publishing the magic, otherwise Linux can read stale RAM.
+ */
+/* Candidate mailboxes, all written every publish.  A full Linux boot wipes some
+ * of these (early page tables below the kernel image, display buffers in CDRAM),
+ * so probe several and read them all back after boot. */
+static const uint32_t log_mailboxes[] = {
+	0x20400000u,   /* CDRAM just past the framebuffer */
+	0x21000000u,   /* CDRAM, past the display buffers */
+	0x22000000u,   /* CDRAM, well clear */
+	0x40800000u,   /* main DRAM, below kernel System RAM */
+};
+#define LOG_MAILBOX_MAX  8000u
+
+static char log_buf[LOG_MAILBOX_MAX + 1];
+static unsigned log_len;
+
+static void dcache_clean_range(uint32_t start, uint32_t len)
+{
+	uint32_t addr = start & ~31u;
+	uint32_t end = (start + len) & ~31u;
+	for (; addr <= end; addr += 32)
+		__asm__ volatile("mcr p15, 0, %0, c7, c10, 1" :: "r"(addr)); /* DCCMVAC */
+	__asm__ volatile("dsb" ::: "memory");
+}
+
+static void log_mailbox_publish_at(uint32_t base)
+{
+	volatile uint32_t *hdr = (volatile uint32_t *)base;
+	char *dst = (char *)(base + 16);
+
+	hdr[2] = 0;                      /* unpublish while updating */
+	memcpy(dst, log_buf, log_len + 1);
+	dcache_clean_range(base, 16 + log_len + 1);
+	hdr[0] = 0x47444456;             /* "VDDG" */
+	hdr[1] = log_len;
+	hdr[3] = 0;
+	dcache_clean_range(base, 16);
+	hdr[2] = 0x4C4F4700;             /* "LOG." */
+	dcache_clean_range(base, 16);
+}
+
+static void log_mailbox_publish(void)
+{
+	unsigned i;
+	for (i = 0; i < sizeof(log_mailboxes) / sizeof(log_mailboxes[0]); i++)
+		log_mailbox_publish_at(log_mailboxes[i]);
+}
+
 static void LOG(const char *str, ...)
 {
 	static int console_y = 200;
 	char buf[256];
 	va_list argptr;
+	int n;
 
 	va_start(argptr, str);
-	vsnprintf(buf, sizeof(buf), str, argptr);
+	n = vsnprintf(buf, sizeof(buf), str, argptr);
 	va_end(argptr);
 
 	uart_print(0, buf);
 	font_draw_string(10, console_y+=20, WHITE, buf);
 
-	if (log_file_ready) {
-		FIL f;
-		UINT bw;
-		if (f_open(&f, VDDG_LOGFILE, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
-			f_lseek(&f, f_size(&f));
-			f_write(&f, buf, (UINT)strlen(buf), &bw);
-			f_sync(&f);
-			f_close(&f);
-		}
+	/* Mirror into the mailbox, keeping the whole text NUL-terminated so Linux
+	 * can treat it as a C string. */
+	if (n > 0 && log_len < LOG_MAILBOX_MAX) {
+		unsigned room = LOG_MAILBOX_MAX - log_len;
+		unsigned take = ((unsigned)n < room) ? (unsigned)n : room;
+		memcpy(log_buf + log_len, buf, take);
+		log_len += take;
+		log_buf[log_len] = 0;
+		log_mailbox_publish();
 	}
 }
 
@@ -288,7 +355,7 @@ static void __attribute__((unused)) gpu_vid_sweep2(const char *tag)
  * controller.  The loader's log then stays on screen indefinitely, so it can be
  * read directly, and X cold-resets back to VitaOS.  No writes, no new machinery.
  */
-#define VDDG_HOLD 1
+#define VDDG_HOLD 0
 
 /* Returns the byte Sony would actually put on the wire, or 0xFFFFFFFF if
  * the request would be rejected.  `arm` receives a short label naming the

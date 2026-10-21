@@ -52,6 +52,440 @@ static void LOG(const char *str, ...)
 	font_draw_string(10, console_y+=20, WHITE, buf);
 }
 
+/*
+ * VitaOS lowio.skprx implements its GPU-domain-on export as SMC 0x110 with
+ * r0=0 (GPU domain) and r1=1 (on).  Keep this wrapper explicit: the current
+ * vita-libbaremetal smc() helper incorrectly loads r1-r3 from arg1, which
+ * would turn this request into r0=0, r1=0 (off).
+ */
+static uint32_t gpu_power_domain_on(void)
+{
+	register uint32_t r0 asm("r0") = 0;
+	register uint32_t r1 asm("r1") = 1;
+	register uint32_t r2 asm("r2") = 0;
+	register uint32_t r3 asm("r3") = 0;
+	register uint32_t r12 asm("r12") = 0x110;
+
+	asm volatile(
+		"smc #0\n	"
+		: "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3)
+		: "r"(r12)
+		: "memory", "cc"
+	);
+
+	return r0;
+}
+
+/*
+ * VitaOS SceLowio gpu_on evidence (lowio.skprx.elf, local decompilation):
+ *   ScePervasiveForDriver_84EAB5BC -> SMC 0x110, r0=0, r1=1 (power domain on)
+ *   ScePervasiveForDriver_39E51AE2 -> gate[0x10] |= (gate & 0xF000F)
+ *   ScePervasiveForDriver_8A85E36B -> reset[0x10] &= ~1
+ * Physical bases resolved from the lowio init table:
+ *   reset  0xE3101000   (s_data_8100B094)
+ *   gate   0xE3102000   (s_data_8100B09C)
+ *   clocks 0xE3103000   (s_data_8100B0A0)
+ *   vid    0xE3104000   (s_data_8100B08C)
+ * This is the platform enable only. No SGX register is written.
+ */
+#define PERVASIVE_RESET 0xE3101000u
+#define PERVASIVE_GATE  0xE3102000u
+#define PERVASIVE_CLK   0xE3103000u
+#define PERVASIVE_VID   0xE3104000u
+
+/*
+ * VitaOS SceLowio/ScePower GPU Xbar evidence (SMC table + power.elf disasm):
+ *   SMC 0x114 op 2 = smc_bus_freq_op(2, freq) = Set GPU Xbar frequency
+ *   lowio export ScePervasiveForDriver_7D02215D = sub_8100001E(2, a1)
+ *   ScePower stub 0x810046C0; passes freq index 0 (166 MHz) when GPU clk <= 166.
+ * The GPU Xbar is the crossbar between the ARM and the SGX543 register file.
+ */
+static uint32_t gpu_xbar_freq_set(uint32_t freq)
+{
+	register uint32_t r0 asm("r0") = 2; /* op 2 = Set GPU Xbar frequency */
+	register uint32_t r1 asm("r1") = freq;
+	register uint32_t r2 asm("r2") = 0;
+	register uint32_t r3 asm("r3") = 0;
+	register uint32_t r12 asm("r12") = 0x114;
+
+	asm volatile(
+		"smc #0\n\t"
+		: "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3)
+		: "r"(r12)
+		: "memory", "cc"
+	);
+
+	return r0;
+}
+
+static void gpu_pervasive_on_logged(void)
+{
+	volatile uint32_t *reset = (volatile uint32_t *)PERVASIVE_RESET;
+	volatile uint32_t *gate  = (volatile uint32_t *)PERVASIVE_GATE;
+	volatile uint32_t *clk   = (volatile uint32_t *)PERVASIVE_CLK;
+	volatile uint32_t *vid   = (volatile uint32_t *)PERVASIVE_VID;
+
+	LOG("GPU gate: pervasive before reset=%08X gate=%08X clk=%08X vid=%08X\n",
+	    reset[0x10/4], gate[0x10/4], clk[0x10/4], vid[0x10/4]);
+
+	LOG("GPU gate: SMC 0x110 domain=0 state=1\n");
+	LOG("GPU gate: SMC return=0x%08X\n", gpu_power_domain_on());
+
+	LOG("GPU gate: SMC 0x114 op=2 xbar_freq=0\n");
+	LOG("GPU gate: SMC 0x114 return=0x%08X\n", gpu_xbar_freq_set(0));
+
+	gate[0x10/4] |= 0xF000F;
+	LOG("GPU gate: gate[0x10] set -> %08X\n", gate[0x10/4]);
+
+	reset[0x10/4] &= ~1u;
+	LOG("GPU gate: reset[0x10] clear -> %08X\n", reset[0x10/4]);
+
+	LOG("GPU gate: pervasive after reset=%08X gate=%08X clk=%08X vid=%08X\n",
+	    reset[0x10/4], gate[0x10/4], clk[0x10/4], vid[0x10/4]);
+}
+
+/*
+ * Read-only sweep, v2: short 4-word lines that fit the 1280px framebuffer
+ * (glyphs are ~16px wide, so ~78 chars max per line) and multiple read
+ * contexts for the +0x10 slot to detect any read-order latching:
+ *   v0: reads +0x10 FIRST, then +0x00/+0x04/+0x08
+ *   v1: reads +0x0C/+0x14/+0x18/+0x1C (no +0x10)
+ *   k:  reads reset/gate/clk +0x10, then +0x10 again as the 4th
+ *   m:  reads misc+0xB0, gate+0x24, reset+0x24, then +0x10 again
+ *   v2/v3: the rest of the VID block
+ */
+static void __attribute__((unused)) gpu_vid_sweep2(const char *tag)
+{
+	volatile uint32_t *vid  = (volatile uint32_t *)PERVASIVE_VID;
+	volatile uint32_t *gate = (volatile uint32_t *)PERVASIVE_GATE;
+	volatile uint32_t *reset = (volatile uint32_t *)PERVASIVE_RESET;
+	volatile uint32_t *clk  = (volatile uint32_t *)PERVASIVE_CLK;
+	volatile uint32_t *misc = (volatile uint32_t *)0xE3100000;
+
+	LOG("%s v0: %08X %08X %08X %08X\n", tag,
+	    vid[0x10/4], vid[0x00/4], vid[0x04/4], vid[0x08/4]);
+	LOG("%s v1: %08X %08X %08X %08X\n", tag,
+	    vid[0x0C/4], vid[0x14/4], vid[0x18/4], vid[0x1C/4]);
+	LOG("%s k: %08X %08X %08X %08X\n", tag,
+	    reset[0x10/4], gate[0x10/4], clk[0x10/4], vid[0x10/4]);
+	LOG("%s m: %08X %08X %08X %08X\n", tag,
+	    misc[0xB0/4], gate[0x24/4], reset[0x24/4], vid[0x10/4]);
+	LOG("%s v2: %08X %08X %08X %08X\n", tag,
+	    vid[0x20/4], vid[0x24/4], vid[0x28/4], vid[0x2C/4]);
+	LOG("%s v3: %08X %08X %08X %08X\n", tag,
+	    vid[0x30/4], vid[0x34/4], vid[0x38/4], vid[0x3C/4]);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * VDDG gate (2026-08-31).  Static prerequisites recovered in
+ * lab/gpu-re/PHASE1-VDDG-STATIC-RESULT-2026-08-31.md:
+ *
+ *   sceSysconCtrlVoltageForDriver = SceSysconForDriver NID 0x7F198FA2,
+ *   syscon.skprx 0x81005AAC -> syscon command 0x88E, wire length 3,
+ *   data bytes [rail, code].  rail 4 = VDDG.
+ *
+ *   ScePower computes code = 0x8A - vid, with two cached VIDs copied from
+ *   the ScePervasiveVid block (0xE3104000):
+ *       +0x44 = 0x23  high-clock VID -> code 0x67
+ *       +0x48 = 0x2E  low-clock  VID -> code 0x5C
+ *
+ * Sony's handler is NOT a straight pass-through.  Decision tree at
+ * 0x81005AAC (hw = hardware-info word, masked 0x00FF0000):
+ *
+ *   if (code <= 0x3F):
+ *        if (hw >= 0x600000) -> extra checks; else send raw
+ *   else:                                  <-- BOTH our codes land here
+ *        if (hw >= 0x600000):
+ *              if (hw != 0x700000) -> REJECT (0x80250001)
+ *              else -> fall into the remap path below
+ *        remap path: require (code - 0x4D) <= 0x3F, then code = 0x8C - code
+ *
+ * So for code 0x67 the byte that actually reaches syscon is either 0x67
+ * (raw) or 0x8C-0x67 = 0x25 (remapped), depending on the SoC revision.
+ * We do NOT know PSTV's hardware-info word, so we reproduce the tree
+ * exactly rather than guessing, and we log the inputs and the resolved
+ * byte so the run is interpretable even if the write has no visible
+ * effect.
+ *
+ * libbaremetal note: syscon_short_command_write(cmd, data, length) writes
+ * (length + 1) to the wire length field.  Sony's ksceSysconCtrlDeviceReset
+ * uses wire length 3 and libbaremetal expresses the same call as
+ * syscon_short_command_write(0x88F, ..., 2) -- so its `length` argument is
+ * the DATA BYTE COUNT.  Our packet has 2 data bytes [rail, code] and wire
+ * length 3, therefore length = 2.
+ */
+#define SYSCON_CMD_CTRL_VOLTAGE  0x88E
+#define VDDG_RAIL                4
+
+/*
+ * RESOLVE-ONLY MODE.
+ *
+ * The 2026-10-20 run of the corrected gate hung the device: it was the first
+ * build in which syscon_short_command_write(0x88E, ...) ever executed, and the
+ * box went off the network instead of reaching Linux. Sony's gate logic is
+ * therefore still unverified, and sending the write again would just re-hang.
+ *
+ * This build computes and logs the gate decision and returns BEFORE any write,
+ * so the polarity fix can be checked with no syscon traffic at all. The rest of
+ * main() (platform enable, probes, Linux handoff) is untouched: the box should
+ * still boot Linux, which is what lets the CDRAM framebuffer log be read back.
+ *
+ * Set to 0 to restore write behaviour (and re-read the bounded-wait note first).
+ */
+#define VDDG_RESOLVE_ONLY 1
+
+/* Returns the byte Sony would actually put on the wire, or 0xFFFFFFFF if
+ * the request would be rejected.  `arm` receives a short label naming the
+ * path taken so a hardware run can be interpreted without re-deriving it.
+ *
+ * Sony's tree has TWO INDEPENDENT gate blocks, each re-reading hardware
+ * info.  Reading them as one shared tree is wrong, and an earlier version of
+ * this function got the high-code path backwards as a result:
+ *
+ *   entry (0x81005aac):  cmp r1,#0x3F ; bhi BLOCK_B
+ *   BLOCK_A (code <= 0x3F):
+ *       bl hw ; and #0xFF0000 ; cmp #0x600000 ; bcs 0x81005b20
+ *       fallthrough -> SEND RAW
+ *   BLOCK_A_rev (0x81005b20, hw >= 0x600000):
+ *       cmp #0x700000 ; beq SEND_RAW
+ *       cmp #0x800000 ; bcs 0x81005b32
+ *       cmp #0x720000 ; bne ERROR
+ *   0x81005b32: cmp r5,#0x3B ; bhi SEND_RAW ; else ERROR
+ *
+ *   BLOCK_B (code > 0x3F, 0x81005b04):
+ *       bl hw ; and #0xFF0000 ; cmp #0x600000 ; bcs 0x81005b3e
+ *       fallthrough -> REMAP   (hw < 0x600000)
+ *   BLOCK_B_rev (0x81005b3e, hw >= 0x600000):
+ *       cmp #0x700000 ; bne SEND_RAW      <-- every non-0x700000 SoC sends RAW
+ *       b REMAP                            <-- only 0x700000 remaps
+ *   REMAP (0x81005b12):
+ *       sub r3,r5,#0x4D ; cmp r3,#0x3F ; bhi ERROR
+ *       rsb r5,r5,#0x8C ; b SEND
+ *
+ * So on PSTV (hw_masked == 0x720000) a high code such as 0x67 is sent RAW,
+ * with no rejection and no remap.  The 2026-08-31 run reported "REJECTED by
+ * revision gate" -- that was this function's error, not Sony's.
+ */
+static uint32_t vddg_resolve_code(uint32_t code, uint32_t hw_masked,
+				  const char **arm)
+{
+	if (code <= 0x3F) {
+		*arm = "A:raw";
+		if (hw_masked >= 0x600000) {
+			if (hw_masked == 0x700000)
+				return code;
+			if (hw_masked == 0x720000 || hw_masked >= 0x800000) {
+				/* 0x81005b32 */
+				if (code > 0x3B) {
+					*arm = "A:raw-720/800(code>3B)";
+					return code;
+				}
+				*arm = "A:reject(code<=3B)";
+				return 0xFFFFFFFFu;
+			}
+			*arm = "A:reject(hw-not-listed)";
+			return 0xFFFFFFFFu;
+		}
+		return code;
+	}
+
+	/* code > 0x3F */
+	if (hw_masked >= 0x600000 && hw_masked != 0x700000) {
+		*arm = "B:raw(hw!=0x700000)";
+		return code;
+	}
+
+	/* REMAP path: hw < 0x600000, or hw == 0x700000. */
+	if ((code - 0x4D) > 0x3F) {
+		*arm = "B:reject(remap-range)";
+		return 0xFFFFFFFFu;
+	}
+	*arm = (hw_masked == 0x700000) ? "B:remap(0x700000)" : "B:remap(hw<600000)";
+	return 0x8C - code;
+}
+
+/*
+ * Probe the SGX aperture read-only.  This is the effect check: if the VDDG
+ * write is what the window was waiting on, 0xE8400000 should stop reading
+ * back as the uniform dark pattern.
+ *
+ * SAFETY: this payload runs with NO exception vectors installed (start.s
+ * sets a stack and branches to main; VBAR still points at whatever VitaOS
+ * left).  Under Linux these addresses SIGBUS -- here an imprecise data
+ * abort would be unrecoverable and would hang the box, needing a physical
+ * power cycle.  So we install a minimal vector table with a data-abort
+ * handler that skips the faulting instruction and flags the fault, giving
+ * us a survivable read.
+ *
+ * Note the aborts on this bus are asynchronous/imprecise, so we bracket
+ * each read with a dsb to force the fault to land inside our window.
+ */
+static volatile uint32_t abort_flag;
+static uint32_t saved_vbar;
+
+/* Data-abort handler: mark the fault and resume after the faulting insn.
+ * lr_abt points to faulting_pc + 8 for data aborts. */
+static void __attribute__((naked)) abort_handler(void)
+{
+	asm volatile(
+		"ldr r0, =abort_flag\n	"
+		"mov r1, #1\n	"
+		"str r1, [r0]\n	"
+		"subs pc, lr, #4\n	"
+	);
+}
+
+static void install_abort_vectors(void)
+{
+	/*
+	 * Build a tiny vector table at 0x1F000000 (scratch, well clear of the
+	 * Linux mailboxes at 0x7F00 and the payload itself) and point VBAR at
+	 * it.  Every entry is 'ldr pc, [pc, #24]' -> address slot, so the
+	 * table is 8 branch words + 8 address words.
+	 */
+	volatile uint32_t *vt = (volatile uint32_t *)0x1F000000;
+	unsigned int i;
+
+	asm volatile("mrc p15, 0, %0, c12, c0, 0" : "=r"(saved_vbar));
+
+	for (i = 0; i < 8; i++) {
+		vt[i] = 0xE59FF018;              /* ldr pc, [pc, #24] */
+		vt[8 + i] = (uint32_t)abort_handler;
+	}
+
+	asm volatile("dsb\n	"
+		     "isb\n	"
+		     "mcr p15, 0, %0, c12, c0, 0\n	"   /* VBAR = vt */
+		     "isb\n	"
+		     : : "r"(vt) : "memory");
+}
+
+/* Put VBAR back exactly as VitaOS left it, before handing off to Linux. */
+static void restore_vectors(void)
+{
+	asm volatile("dsb\n	"
+		     "isb\n	"
+		     "mcr p15, 0, %0, c12, c0, 0\n	"
+		     "isb\n	"
+		     : : "r"(saved_vbar) : "memory");
+}
+
+/* Read one word with abort protection.  Returns 1 on success. */
+static int safe_read32(uint32_t addr, uint32_t *out)
+{
+	uint32_t v;
+
+	abort_flag = 0;
+	asm volatile("dsb" ::: "memory");
+	v = *(volatile uint32_t *)addr;
+	asm volatile("dsb" ::: "memory");
+
+	if (abort_flag) {
+		*out = 0;
+		return 0;
+	}
+	*out = v;
+	return 1;
+}
+
+static void sgx_probe(const char *tag)
+{
+	uint32_t sgx = 0, rb = 0, gb = 0;
+	int s, r, g;
+
+	s = safe_read32(0xE8400000, &sgx);   /* the SGX itself */
+	r = safe_read32(0xE8000000, &rb);    /* secure SonyRegbus */
+	g = safe_read32(0xED800000, &gb);    /* GPU reg bus - positive control */
+
+	LOG("%s sgx=%s%08X rb=%s%08X gb=%s%08X\n", tag,
+	    s ? "" : "AB:", sgx,
+	    r ? "" : "AB:", rb,
+	    g ? "" : "AB:", gb);
+}
+
+static void vddg_gate(void)
+{
+	volatile uint32_t *vid = (volatile uint32_t *)PERVASIVE_VID;
+	uint32_t vid_hi, vid_lo, code_hi, wire_hi;
+	uint32_t hw, hw_masked;
+	const char *arm = "?";
+
+	/* 1. Read the VIDs from the block ScePower actually sources them from. */
+	vid_hi = vid[0x44 / 4];
+	vid_lo = vid[0x48 / 4];
+	LOG("VDDG vid hi=%08X lo=%08X\n", vid_hi, vid_lo);
+
+	/* 2. Sony's revision gate input. */
+	hw = (uint32_t)syscon_get_hardware_info();
+	hw_masked = hw & 0x00FF0000u;
+	LOG("VDDG hw=%08X mask=%08X\n", hw, hw_masked);
+
+	/* 3. Resolve the wire byte the way Sony would. */
+	code_hi = 0x8A - vid_hi;
+	arm = "?";
+	wire_hi = vddg_resolve_code(code_hi, hw_masked, &arm);
+	LOG("VDDG code=%02X arm=%s wire=%08X\n", code_hi, arm, wire_hi);
+	{
+		/* Second cached VID, resolved only for gate evidence. */
+		const char *arm_lo = "?";
+		uint32_t code_lo = 0x8A - vid_lo;
+		uint32_t wire_lo = vddg_resolve_code(code_lo, hw_masked, &arm_lo);
+		LOG("VDDG lo=%08X code=%02X arm=%s wire=%08X\n",
+		    vid_lo, code_lo, arm_lo, wire_lo);
+	}
+
+	sgx_probe("VDDG pre");
+
+#if VDDG_RESOLVE_ONLY
+	/*
+	 * No write. Log the decision and return; main() continues into the
+	 * platform enable and the Linux handoff exactly as before.
+	 */
+	LOG("VDDG RESOLVE-ONLY: no write issued\n");
+	return;
+#endif
+
+	if (wire_hi == 0xFFFFFFFFu) {
+		/* Sony's own handler would refuse this request.  Do not send it. */
+		LOG("VDDG REJECTED by revision gate - no write\n");
+		return;
+	}
+
+	/*
+	 * 4. The write.  data = [rail, code] little-endian in the u32:
+	 *    byte0 = rail (4), byte1 = resolved code.
+	 *    length = 2 data bytes (libbaremetal adds 1 -> wire length 3).
+	 */
+	LOG("VDDG WRITE cmd=88E rail=4 code=%02X\n", wire_hi);
+	syscon_short_command_write(SYSCON_CMD_CTRL_VOLTAGE,
+				   VDDG_RAIL | (wire_hi << 8), 2);
+	LOG("VDDG write issued\n");
+
+	/* 5. Let the rail settle, then re-probe. */
+	delay(200);
+	sgx_probe("VDDG post");
+}
+
+/*
+ * Zero the HDMI framebuffer (CDRAM 0x20000000) before the log starts so
+ * stale pixels from the previous boot/VitaOS cannot blend into the glyphs.
+ * The loader draws white-on-black without clearing otherwise.
+ */
+static void clear_framebuffer(void)
+{
+	volatile uint32_t *fb = (volatile uint32_t *)0x20000000;
+	unsigned int i;
+
+	for (i = 0; i < (1280u * 720u * 4u) / 4u; i += 4)
+	{
+		fb[i] = 0;
+		fb[i+1] = 0;
+		fb[i+2] = 0;
+		fb[i+3] = 0;
+	}
+}
+
 static void cpu123_wait(unsigned int cpu_id)
 {
 	volatile unsigned int val, *base = (unsigned int *)CPU123_WAIT_BASE;
@@ -204,6 +638,30 @@ int main(struct sysroot_buffer *sysroot)
 		if (res != FR_OK)
 			goto fatal_error;
 	}
+
+	/*
+	 * VDDG gate, 2026-08-31.
+	 *
+	 * Sony's ScePower raises the GPU core rail BEFORE clocking the GPU up
+	 * (VDDG write at 0x81003576, then the Xbar SMC).  Every previous
+	 * loader experiment skipped the voltage step, so this run reproduces
+	 * the real order: clear the screen, install abort vectors so the SGX
+	 * probe cannot hang the box, write VDDG, THEN run the platform enable,
+	 * then re-probe the aperture.
+	 *
+	 * NOTE: sweep v2 defined clear_framebuffer() but never called it --
+	 * fixed here.
+	 */
+	clear_framebuffer();
+	install_abort_vectors();
+
+	LOG("VDDG GATE %s\n", "2026-08-31");
+	vddg_gate();
+	gpu_pervasive_on_logged();
+	sgx_probe("VDDG final");
+
+	/* Hand VBAR back the way we found it before entering Linux. */
+	restore_vectors();
 
 	LOG("Jumping to Linux!\n");
 	pl310_clean_inv_all();

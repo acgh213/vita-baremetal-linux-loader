@@ -38,34 +38,6 @@ static const unsigned char msif_key[32] = {
 	0x0B, 0x27, 0x13, 0x55, 0x41, 0xD9, 0x2E, 0xC4
 };
 
-/*
- * File logging.
- *
- * The framebuffer is NOT a usable log channel on this PSTV: FB_ADDR is
- * correctly 0x20000000 and the loader does write there, but the display does
- * not scan that buffer out during the loader phase -- the screen is black until
- * Linux configures fbcon.  So a hold can be running correctly and still show
- * nothing, which is exactly what happened.
- *
- * uart_print() is already called below but no serial adapter is attached to the
- * host.  So the log also goes to a file on the mounted FAT volume, which
- * survives the run and can be retrieved over FTP from VitaOS.
- *
- * FF_FS_READONLY is 0 in FatFs/ffconf.h to enable this.  Writes happen only
- * while VitaOS is destroyed and the loader owns the card, and only to this one
- * small file.
- */
-#define VDDG_LOGFILE "/vddg.log"
-static int log_file_ready;   /* set by main() once the volume is mounted */
-
-/* FatFs requires a timestamp source when writes are enabled.  The loader has no
- * meaningful clock, and the log is removed at the start of every run, so a fixed
- * valid date is enough to satisfy the directory-update path. */
-DWORD get_fattime(void)
-{
-	return ((DWORD)(2026 - 1980) << 25) | ((DWORD)1 << 21) | ((DWORD)1 << 16);
-}
-
 static void LOG(const char *str, ...)
 {
 	static int console_y = 200;
@@ -78,17 +50,6 @@ static void LOG(const char *str, ...)
 
 	uart_print(0, buf);
 	font_draw_string(10, console_y+=20, WHITE, buf);
-
-	if (log_file_ready) {
-		FIL f;
-		UINT bw;
-		if (f_open(&f, VDDG_LOGFILE, FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
-			f_lseek(&f, f_size(&f));
-			f_write(&f, buf, (UINT)strlen(buf), &bw);
-			f_sync(&f);
-			f_close(&f);
-		}
-	}
 }
 
 /*
@@ -678,11 +639,6 @@ int main(struct sysroot_buffer *sysroot)
 
 	LOG("Memory card mounted!\n");
 
-	/* Fresh per-run log file, then enable file logging. */
-	f_unlink(VDDG_LOGFILE);
-	log_file_ready = 1;
-	LOG("=== loader log start ===\n");
-
 	res = file_load_log(ZIMAGE, LINUX_LOAD_ADDR);
 	if (res != FR_OK)
 		goto fatal_error;
@@ -720,6 +676,18 @@ int main(struct sysroot_buffer *sysroot)
 	 */
 	clear_framebuffer();
 	install_abort_vectors();
+
+	/*
+	 * Bring up the display controller BEFORE drawing.
+	 *
+	 * The loader writes its log into the framebuffer at 0x20000000 but never
+	 * initialised the display, so nothing was ever scanned out on this PSTV --
+	 * every loader-phase screen has been black regardless of what the code did.
+	 * On a Vita this went unnoticed because VitaOS leaves the OLED running.
+	 * libbaremetal has display_init() with a dedicated HDMI path; use it.
+	 */
+	display_init(sysroot_model_is_vita() ? DISPLAY_TYPE_OLED : DISPLAY_TYPE_HDMI);
+	clear_framebuffer();
 
 	LOG("VDDG GATE %s\n", "2026-08-31");
 	if (vddg_gate())

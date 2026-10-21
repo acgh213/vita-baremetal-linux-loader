@@ -30,6 +30,7 @@
 
 extern unsigned int _bss_start;
 extern unsigned int _bss_end;
+extern void gt_handoff_guard(void);
 
 static const unsigned char msif_key[32] = {
 	0xD4, 0x19, 0xA2, 0xEB, 0x9D, 0x61, 0xA5, 0x2F,
@@ -38,7 +39,7 @@ static const unsigned char msif_key[32] = {
 	0x0B, 0x27, 0x13, 0x55, 0x41, 0xD9, 0x2E, 0xC4
 };
 
-static void LOG(const char *str, ...)
+void LOG(const char *str, ...)
 {
 	static int console_y = 200;
 	char buf[256];
@@ -206,6 +207,7 @@ int main(struct sysroot_buffer *sysroot)
 	}
 
 	LOG("Jumping to Linux!\n");
+	gt_handoff_guard();
 	pl310_clean_inv_all();
 
 	((void (*)(int, int, uintptr_t))LINUX_LOAD_ADDR)(0, 0, DTB_LOAD_ADDR);

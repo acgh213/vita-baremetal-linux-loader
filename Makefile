@@ -1,7 +1,7 @@
 TARGET	= vita-baremetal-linux-loader
 SRCDIR	= src
 INCDIR	= include
-OBJS	= start.o main.o \
+OBJS	= start.o main.o gt_handoff_guard.o \
 	  FatFs/diskio.o FatFs/ff.o FatFs/ffsystem.o FatFs/ffunicode.o
 
 PREFIX	= arm-vita-eabi

@@ -31,6 +31,7 @@
 extern unsigned int _bss_start;
 extern unsigned int _bss_end;
 extern void l1_cache_clean_invalidate(void);
+extern int clock_ratio_probe_run(void (*emit)(const char *format, ...));
 
 static const unsigned char msif_key[32] = {
 	0xD4, 0x19, 0xA2, 0xEB, 0x9D, 0x61, 0xA5, 0x2F,
@@ -284,6 +285,9 @@ int main(struct sysroot_buffer *sysroot)
 		if (res != FR_OK)
 			goto fatal_error;
 	}
+
+	if (clock_ratio_probe_run(LOG) != 0)
+		LOG("Clock ratio probe did not complete.\n");
 
 	LOG("Jumping to Linux!\n");
 

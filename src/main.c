@@ -235,6 +235,22 @@ static void __attribute__((unused)) gpu_vid_sweep2(const char *tag)
  */
 #define VDDG_RESOLVE_ONLY 1
 
+/*
+ * HOLD MODE (resolve-only only).
+ *
+ * The 2026-10-20 run booted Linux successfully but the gate log was
+ * unobservable: Linux's fbcon repainted the shared framebuffer, and the gate
+ * text was gone before it could be read.  FatFs here is compiled read-only
+ * (FF_FS_READONLY=1) so writing a log file would mean pulling in write support
+ * for a marginal gain, and this box has no serial adapter attached to the host.
+ *
+ * Instead: after logging the decision, stop before the Linux handoff and park on
+ * the existing fatal_error screen ("Press X to restart"), which loops on the
+ * controller.  The loader's log then stays on screen indefinitely, so it can be
+ * read directly, and X cold-resets back to VitaOS.  No writes, no new machinery.
+ */
+#define VDDG_HOLD 1
+
 /* Returns the byte Sony would actually put on the wire, or 0xFFFFFFFF if
  * the request would be rejected.  `arm` receives a short label naming the
  * path taken so a hardware run can be interpreted without re-deriving it.
@@ -404,7 +420,7 @@ static void sgx_probe(const char *tag)
 	    g ? "" : "AB:", gb);
 }
 
-static void vddg_gate(void)
+static int vddg_gate(void)
 {
 	volatile uint32_t *vid = (volatile uint32_t *)PERVASIVE_VID;
 	uint32_t vid_hi, vid_lo, code_hi, wire_hi;
@@ -439,17 +455,23 @@ static void vddg_gate(void)
 
 #if VDDG_RESOLVE_ONLY
 	/*
-	 * No write. Log the decision and return; main() continues into the
-	 * platform enable and the Linux handoff exactly as before.
+	 * No write. Log the decision, then either hold so the log can be read off
+	 * the screen, or return into the platform enable and Linux handoff.
 	 */
 	LOG("VDDG RESOLVE-ONLY: no write issued\n");
-	return;
+#if VDDG_HOLD
+	LOG("VDDG HOLD: stopping before Linux\n");
+	LOG("READ THESE LINES ABOVE\n");
+	return 1;      /* main() parks on fatal_error so the screen persists */
+#else
+	return 0;
+#endif
 #endif
 
 	if (wire_hi == 0xFFFFFFFFu) {
 		/* Sony's own handler would refuse this request.  Do not send it. */
 		LOG("VDDG REJECTED by revision gate - no write\n");
-		return;
+		return 0;
 	}
 
 	/*
@@ -656,7 +678,8 @@ int main(struct sysroot_buffer *sysroot)
 	install_abort_vectors();
 
 	LOG("VDDG GATE %s\n", "2026-08-31");
-	vddg_gate();
+	if (vddg_gate())
+		goto fatal_error;   /* VDDG_HOLD: keep the log on screen */
 	gpu_pervasive_on_logged();
 	sgx_probe("VDDG final");
 

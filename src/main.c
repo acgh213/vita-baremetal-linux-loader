@@ -219,28 +219,72 @@ static void __attribute__((unused)) gpu_vid_sweep2(const char *tag)
 #define VDDG_RAIL                4
 
 /* Returns the byte Sony would actually put on the wire, or 0xFFFFFFFF if
- * the request would be rejected. */
-static uint32_t vddg_resolve_code(uint32_t code, uint32_t hw_masked)
+ * the request would be rejected.  `arm` receives a short label naming the
+ * path taken so a hardware run can be interpreted without re-deriving it.
+ *
+ * Sony's tree has TWO INDEPENDENT gate blocks, each re-reading hardware
+ * info.  Reading them as one shared tree is wrong, and an earlier version of
+ * this function got the high-code path backwards as a result:
+ *
+ *   entry (0x81005aac):  cmp r1,#0x3F ; bhi BLOCK_B
+ *   BLOCK_A (code <= 0x3F):
+ *       bl hw ; and #0xFF0000 ; cmp #0x600000 ; bcs 0x81005b20
+ *       fallthrough -> SEND RAW
+ *   BLOCK_A_rev (0x81005b20, hw >= 0x600000):
+ *       cmp #0x700000 ; beq SEND_RAW
+ *       cmp #0x800000 ; bcs 0x81005b32
+ *       cmp #0x720000 ; bne ERROR
+ *   0x81005b32: cmp r5,#0x3B ; bhi SEND_RAW ; else ERROR
+ *
+ *   BLOCK_B (code > 0x3F, 0x81005b04):
+ *       bl hw ; and #0xFF0000 ; cmp #0x600000 ; bcs 0x81005b3e
+ *       fallthrough -> REMAP   (hw < 0x600000)
+ *   BLOCK_B_rev (0x81005b3e, hw >= 0x600000):
+ *       cmp #0x700000 ; bne SEND_RAW      <-- every non-0x700000 SoC sends RAW
+ *       b REMAP                            <-- only 0x700000 remaps
+ *   REMAP (0x81005b12):
+ *       sub r3,r5,#0x4D ; cmp r3,#0x3F ; bhi ERROR
+ *       rsb r5,r5,#0x8C ; b SEND
+ *
+ * So on PSTV (hw_masked == 0x720000) a high code such as 0x67 is sent RAW,
+ * with no rejection and no remap.  The 2026-08-31 run reported "REJECTED by
+ * revision gate" -- that was this function's error, not Sony's.
+ */
+static uint32_t vddg_resolve_code(uint32_t code, uint32_t hw_masked,
+				  const char **arm)
 {
 	if (code <= 0x3F) {
-		/* Low-code path.  Not used by our VIDs, kept for completeness. */
+		*arm = "A:raw";
 		if (hw_masked >= 0x600000) {
 			if (hw_masked == 0x700000)
 				return code;
-			if (hw_masked >= 0x800000 || hw_masked == 0x720000)
-				return (code > 0x3B) ? code : 0xFFFFFFFFu;
+			if (hw_masked == 0x720000 || hw_masked >= 0x800000) {
+				/* 0x81005b32 */
+				if (code > 0x3B) {
+					*arm = "A:raw-720/800(code>3B)";
+					return code;
+				}
+				*arm = "A:reject(code<=3B)";
+				return 0xFFFFFFFFu;
+			}
+			*arm = "A:reject(hw-not-listed)";
 			return 0xFFFFFFFFu;
 		}
 		return code;
 	}
 
-	/* High-code path -- this is where 0x67 / 0x5C land. */
-	if (hw_masked >= 0x600000) {
-		if (hw_masked != 0x700000)
-			return 0xFFFFFFFFu;   /* would return 0x80250001 */
+	/* code > 0x3F */
+	if (hw_masked >= 0x600000 && hw_masked != 0x700000) {
+		*arm = "B:raw(hw!=0x700000)";
+		return code;
 	}
-	if ((code - 0x4D) > 0x3F)
+
+	/* REMAP path: hw < 0x600000, or hw == 0x700000. */
+	if ((code - 0x4D) > 0x3F) {
+		*arm = "B:reject(remap-range)";
 		return 0xFFFFFFFFu;
+	}
+	*arm = (hw_masked == 0x700000) ? "B:remap(0x700000)" : "B:remap(hw<600000)";
 	return 0x8C - code;
 }
 
@@ -348,6 +392,7 @@ static void vddg_gate(void)
 	volatile uint32_t *vid = (volatile uint32_t *)PERVASIVE_VID;
 	uint32_t vid_hi, vid_lo, code_hi, wire_hi;
 	uint32_t hw, hw_masked;
+	const char *arm = "?";
 
 	/* 1. Read the VIDs from the block ScePower actually sources them from. */
 	vid_hi = vid[0x44 / 4];
@@ -361,8 +406,9 @@ static void vddg_gate(void)
 
 	/* 3. Resolve the wire byte the way Sony would. */
 	code_hi = 0x8A - vid_hi;
-	wire_hi = vddg_resolve_code(code_hi, hw_masked);
-	LOG("VDDG code=%02X wire=%08X\n", code_hi, wire_hi);
+	arm = "?";
+	wire_hi = vddg_resolve_code(code_hi, hw_masked, &arm);
+	LOG("VDDG code=%02X arm=%s wire=%08X\n", code_hi, arm, wire_hi);
 
 	sgx_probe("VDDG pre");
 
